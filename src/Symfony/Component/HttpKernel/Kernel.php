@@ -329,11 +329,19 @@ abstract class Kernel implements KernelInterface, TerminableInterface
     }
 
     /**
-     * Used internally.
+     * @internal
      */
     public function setClassCache(array $classes)
     {
         file_put_contents($this->getCacheDir().'/classes.map', sprintf('<?php return %s;', var_export($classes, true)));
+    }
+
+    /**
+     * @internal
+     */
+    public function setAnnotatedClassCache(array $annotatedClasses)
+    {
+        file_put_contents($this->getCacheDir().'/annotations.map', sprintf('<?php return %s;', var_export($annotatedClasses, true)));
     }
 
     /**
@@ -432,8 +440,8 @@ abstract class Kernel implements KernelInterface, TerminableInterface
                 $hierarchy[] = $name;
             }
 
-            foreach ($hierarchy as $bundle) {
-                $this->bundleMap[$bundle] = $bundleMap;
+            foreach ($hierarchy as $hierarchyBundle) {
+                $this->bundleMap[$hierarchyBundle] = $bundleMap;
                 array_pop($bundleMap);
             }
         }

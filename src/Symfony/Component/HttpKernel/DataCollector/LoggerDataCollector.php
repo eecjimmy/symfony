@@ -11,6 +11,7 @@
 
 namespace Symfony\Component\HttpKernel\DataCollector;
 
+use Symfony\Component\Debug\Exception\SilencedErrorContext;
 use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 use Symfony\Component\HttpKernel\Log\DebugLoggerInterface;
@@ -69,18 +70,6 @@ class LoggerDataCollector extends DataCollector implements LateDataCollectorInte
     }
 
     /**
-     * Gets the called events.
-     *
-     * @return array An array of called events
-     *
-     * @see TraceableEventDispatcherInterface
-     */
-    public function countErrors()
-    {
-        return isset($this->data['error_count']) ? $this->data['error_count'] : 0;
-    }
-
-    /**
      * Gets the logs.
      *
      * @return array An array of logs
@@ -93,6 +82,11 @@ class LoggerDataCollector extends DataCollector implements LateDataCollectorInte
     public function getPriorities()
     {
         return isset($this->data['priorities']) ? $this->data['priorities'] : array();
+    }
+
+    public function countErrors()
+    {
+        return isset($this->data['error_count']) ? $this->data['error_count'] : 0;
     }
 
     public function countDeprecations()
@@ -119,45 +113,64 @@ class LoggerDataCollector extends DataCollector implements LateDataCollectorInte
         $sanitizedLogs = array();
 
         foreach ($logs as $log) {
-            $context = $this->sanitizeContext($log['context']);
+            if (!$this->isSilencedOrDeprecationErrorLog($log)) {
+                $log['context'] = $this->sanitizeContext($log['context']);
+                $sanitizedLogs[] = $log;
 
-            if (isset($context['type'], $context['file'], $context['line'], $context['level'])) {
-                $errorId = md5("{$context['type']}/{$context['line']}/{$context['file']}\x00{$log['message']}", true);
-                $silenced = !($context['type'] & $context['level']);
-                if (isset($this->errorNames[$context['type']])) {
-                    $context = array_merge(array('name' => $this->errorNames[$context['type']]), $context);
-                }
-
-                if (isset($errorContextById[$errorId])) {
-                    if (isset($errorContextById[$errorId]['errorCount'])) {
-                        ++$errorContextById[$errorId]['errorCount'];
-                    } else {
-                        $errorContextById[$errorId]['errorCount'] = 2;
-                    }
-
-                    if (!$silenced && isset($errorContextById[$errorId]['scream'])) {
-                        unset($errorContextById[$errorId]['scream']);
-                        $errorContextById[$errorId]['level'] = $context['level'];
-                    }
-
-                    continue;
-                }
-
-                $errorContextById[$errorId] = &$context;
-                if ($silenced) {
-                    $context['scream'] = true;
-                }
-
-                $log['context'] = &$context;
-                unset($context);
-            } else {
-                $log['context'] = $context;
+                continue;
             }
 
-            $sanitizedLogs[] = $log;
+            $exception = $log['context']['exception'];
+
+            $context = array(
+                'type' => isset($this->errorNames[$exception->getSeverity()]) ? $this->errorNames[$exception->getSeverity()] : $exception->getSeverity(),
+                'file' => $exception->getFile(),
+                'line' => $exception->getLine(),
+                'errorCount' => 0,
+                'scream' => $exception instanceof SilencedErrorContext,
+            );
+
+            if ($exception instanceof \Exception) {
+                $context['trace'] = array_map(function ($call) {
+                    unset($call['args']);
+
+                    return $call;
+                }, $exception->getTrace());
+            }
+
+            $errorId = md5("{$context['type']}/{$context['line']}/{$context['file']}\x00{$log['message']}", true);
+
+            if (!isset($errorContextById[$errorId])) {
+                $errorContextById[$errorId] = $context;
+            }
+
+            $context['errorCount'] = ++$errorContextById[$errorId]['errorCount'];
+
+            $log['context'] = $this->sanitizeContext($context);
+
+            $sanitizedLogs[$errorId] = $log;
         }
 
-        return $sanitizedLogs;
+        return array_values($sanitizedLogs);
+    }
+
+    private function isSilencedOrDeprecationErrorLog(array $log)
+    {
+        if (!isset($log['context']['exception'])) {
+            return false;
+        }
+
+        $exception = $log['context']['exception'];
+
+        if ($exception instanceof SilencedErrorContext) {
+            return true;
+        }
+
+        if ($exception instanceof \ErrorException && in_array($exception->getSeverity(), array(E_DEPRECATED, E_USER_DEPRECATED), true)) {
+            return true;
+        }
+
+        return false;
     }
 
     private function sanitizeContext($context)
@@ -172,6 +185,22 @@ class LoggerDataCollector extends DataCollector implements LateDataCollectorInte
 
         if (is_resource($context)) {
             return sprintf('Resource(%s)', get_resource_type($context));
+        }
+
+        if ($context instanceof \Exception) {
+            $trace = array_map(function ($call) {
+                unset($call['args']);
+
+                return $call;
+            }, $context->getTrace());
+
+            return array(
+                'class' => get_class($context),
+                'message' => $context->getMessage(),
+                'file' => $context->getFile(),
+                'line' => $context->getLine(),
+                'trace' => $trace,
+            );
         }
 
         if (is_object($context)) {
@@ -200,11 +229,11 @@ class LoggerDataCollector extends DataCollector implements LateDataCollectorInte
                 );
             }
 
-            if (isset($log['context']['type'], $log['context']['level'])) {
-                if (E_DEPRECATED === $log['context']['type'] || E_USER_DEPRECATED === $log['context']['type']) {
-                    ++$count['deprecation_count'];
-                } elseif (!($log['context']['type'] & $log['context']['level'])) {
+            if ($this->isSilencedOrDeprecationErrorLog($log)) {
+                if ($log['context']['exception'] instanceof SilencedErrorContext) {
                     ++$count['scream_count'];
+                } else {
+                    ++$count['deprecation_count'];
                 }
             }
         }

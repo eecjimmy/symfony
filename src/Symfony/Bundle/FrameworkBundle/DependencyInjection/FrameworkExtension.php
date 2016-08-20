@@ -30,7 +30,6 @@ use Symfony\Component\Serializer\Mapping\Factory\CacheClassMetadataFactory;
 use Symfony\Component\Serializer\Normalizer\DataUriNormalizer;
 use Symfony\Component\Serializer\Normalizer\DateTimeNormalizer;
 use Symfony\Component\Serializer\Normalizer\JsonSerializableNormalizer;
-use Symfony\Component\Validator\Validation;
 use Symfony\Component\Workflow;
 
 /**
@@ -132,6 +131,7 @@ class FrameworkExtension extends Extension
         $this->registerProfilerConfiguration($config['profiler'], $container, $loader);
         $this->registerCacheConfiguration($config['cache'], $container);
         $this->registerWorkflowConfiguration($config['workflows'], $container, $loader);
+        $this->registerDebugConfiguration($config['php_errors'], $container, $loader);
 
         if ($this->isConfigEnabled($container, $config['router'])) {
             $this->registerRouterConfiguration($config['router'], $container, $loader);
@@ -148,26 +148,13 @@ class FrameworkExtension extends Extension
             $this->registerPropertyInfoConfiguration($config['property_info'], $container, $loader);
         }
 
-        $loader->load('debug_prod.xml');
-        $definition = $container->findDefinition('debug.debug_handlers_listener');
+        $this->addAnnotatedClassesToCompile(array(
+            '**Bundle\\Controller\\',
+            '**Bundle\\Entity\\',
 
-        if ($container->hasParameter('templating.helper.code.file_link_format')) {
-            $definition->replaceArgument(5, '%templating.helper.code.file_link_format%');
-        }
-
-        if ($container->getParameter('kernel.debug')) {
-            $definition->replaceArgument(2, E_ALL & ~(E_COMPILE_ERROR | E_PARSE | E_ERROR | E_CORE_ERROR | E_RECOVERABLE_ERROR));
-
-            $loader->load('debug.xml');
-
-            // replace the regular event_dispatcher service with the debug one
-            $definition = $container->findDefinition('event_dispatcher');
-            $definition->setPublic(false);
-            $container->setDefinition('debug.event_dispatcher.parent', $definition);
-            $container->setAlias('event_dispatcher', 'debug.event_dispatcher');
-        } else {
-            $definition->replaceArgument(1, null);
-        }
+            // Added explicitly so that we don't rely on the class map being dumped to make it work
+            'Symfony\\Bundle\\FrameworkBundle\\Controller\\Controller',
+        ));
 
         $this->addClassesToCompile(array(
             'Symfony\\Component\\Config\\ConfigCache',
@@ -408,6 +395,48 @@ class FrameworkExtension extends Extension
                 $registryDefinition->addMethodCall('add', array(new Reference($workflowId), $supportedClass));
             }
         }
+    }
+
+    /**
+     * Loads the debug configuration.
+     *
+     * @param array            $config    A php errors configuration array
+     * @param ContainerBuilder $container A ContainerBuilder instance
+     * @param XmlFileLoader    $loader    An XmlFileLoader instance
+     */
+    private function registerDebugConfiguration(array $config, ContainerBuilder $container, XmlFileLoader $loader)
+    {
+        $loader->load('debug_prod.xml');
+
+        $debug = $container->getParameter('kernel.debug');
+
+        if ($debug) {
+            $loader->load('debug.xml');
+
+            // replace the regular event_dispatcher service with the debug one
+            $definition = $container->findDefinition('event_dispatcher');
+            $definition->setPublic(false);
+            $container->setDefinition('debug.event_dispatcher.parent', $definition);
+            $container->setAlias('event_dispatcher', 'debug.event_dispatcher');
+        }
+
+        $definition = $container->findDefinition('debug.debug_handlers_listener');
+
+        if (!$config['log']) {
+            $definition->replaceArgument(1, null);
+        }
+
+        if (!$config['throw']) {
+            $container->setParameter('debug.error_handler.throw_at', 0);
+        }
+
+        $definition->replaceArgument(4, $debug);
+
+        if ($container->hasParameter('templating.helper.code.file_link_format')) {
+            $definition->replaceArgument(5, '%templating.helper.code.file_link_format%');
+        }
+
+        $definition->replaceArgument(6, $debug);
     }
 
     /**
@@ -906,8 +935,22 @@ class FrameworkExtension extends Extension
         $loader->load('annotations.xml');
 
         if ('none' !== $config['cache']) {
-            if ('file' === $config['cache']) {
+            $cacheService = $config['cache'];
+
+            if ('php_array' === $config['cache']) {
+                $cacheService = 'annotations.cache';
+
+                // Enable warmer only if PHP array is used for cache
+                $definition = $container->findDefinition('annotations.cache_warmer');
+                $definition->addTag('kernel.cache_warmer');
+
+                $this->addClassesToCompile(array(
+                    'Symfony\Component\Cache\Adapter\PhpArrayAdapter',
+                    'Symfony\Component\Cache\DoctrineProvider',
+                ));
+            } elseif ('file' === $config['cache']) {
                 $cacheDir = $container->getParameterBag()->resolveValue($config['file_cache_dir']);
+
                 if (!is_dir($cacheDir) && false === @mkdir($cacheDir, 0777, true) && !is_dir($cacheDir)) {
                     throw new \RuntimeException(sprintf('Could not create cache directory "%s".', $cacheDir));
                 }
@@ -916,11 +959,13 @@ class FrameworkExtension extends Extension
                     ->getDefinition('annotations.filesystem_cache')
                     ->replaceArgument(0, $cacheDir)
                 ;
+
+                $cacheService = 'annotations.filesystem_cache';
             }
 
             $container
                 ->getDefinition('annotations.cached_reader')
-                ->replaceArgument(1, new Reference('file' !== $config['cache'] ? $config['cache'] : 'annotations.filesystem_cache'))
+                ->replaceArgument(1, new Reference($cacheService))
                 ->replaceArgument(2, $config['debug'])
                 ->addAutowiringType(Reader::class)
             ;
@@ -1130,10 +1175,8 @@ class FrameworkExtension extends Extension
         }
 
         $this->addClassesToCompile(array(
-            'Psr\Cache\CacheItemInterface',
-            'Psr\Cache\CacheItemPoolInterface',
-            'Symfony\Component\Cache\Adapter\AdapterInterface',
-            'Symfony\Component\Cache\Adapter\AbstractAdapter',
+            'Symfony\Component\Cache\Adapter\ApcuAdapter',
+            'Symfony\Component\Cache\Adapter\FilesystemAdapter',
             'Symfony\Component\Cache\CacheItem',
         ));
     }
